@@ -1,116 +1,122 @@
 #!/usr/bin/env bash
-# 多IP独立端口搭建脚本 - 运行完自动输出完整节点链接
-# 使用：bash 此脚本 "38.182.100.41 38.182.100.15"
+# 只添加 Hysteria2 多端口版 - 追加到原有 sb.json
+# 用法: bash 此脚本.sh [端口数量，默认2]
 
 set -e
 
 HOME_DIR="/root/agsbx"
-XR_JSON="$HOME_DIR/xr.json"
-BACKUP_JSON="$HOME_DIR/xr.json.bak-$(date +%Y%m%d-%H%M%S)"
-XRK_DIR="$HOME_DIR/xrk"
+SB_JSON="$HOME_DIR/sb.json"
+CERT_PEM="$HOME_DIR/cert.pem"
+KEY_PEM="$HOME_DIR/private.key"
+UUID_FILE="$HOME_DIR/uuid"
 
-# 检查参数
-if [ $# -ne 1 ] || [ $(echo "$1" | wc -w) -ne 2 ]; then
-    echo "使用示例：bash $0 \"38.182.100.41 38.182.100.15\""
-    exit 1
-fi
-
-IFS=' ' read -r ip1 ip2 <<< "$1"
-echo "IP1: $ip1"
-echo "IP2: $ip2"
-
-# 检查必要文件
-required_files=("$HOME_DIR/uuid" "$XR_JSON" "$XRK_DIR/private_key" "$XRK_DIR/public_key" "$XRK_DIR/short_id" "$HOME_DIR/ym_vl_re")
-missing=""
-for f in "${required_files[@]}"; do
-    [ ! -f "$f" ] && missing="$missing $f"
+# 检查前提文件
+for f in "$SB_JSON" "$CERT_PEM" "$KEY_PEM" "$UUID_FILE"; do
+    if [ ! -f "$f" ]; then
+        echo "缺少文件: $f"
+        echo "请先运行原脚本启用 Hysteria2 或其他协议（hypt=443 bash argosbx.sh）"
+        exit 1
+    fi
 done
-if [ -n "$missing" ]; then
-    echo "缺少文件：$missing"
-    echo "请先运行原argosbx.sh安装（带 vlpt= sopt=）"
+
+uuid=$(cat "$UUID_FILE")
+sni="www.bing.com"   # 可改成你喜欢的伪装域名
+
+# 默认添加 2 个端口
+num_ports=${1:-2}
+if ! [[ "$num_ports" =~ ^[1-9][0-9]?$ ]]; then
+    echo "参数应为 1-99 的整数（端口数量），默认 2"
     exit 1
 fi
 
-uuid=$(cat "$HOME_DIR/uuid")
-private_key=$(cat "$XRK_DIR/private_key")
-public_key=$(cat "$XRK_DIR/public_key")
-short_id=$(cat "$XRK_DIR/short_id")
-sni=$(cat "$HOME_DIR/ym_vl_re" 2>/dev/null || echo "apple.com")
-dest="$sni:443"
+echo "本次将添加 $num_ports 个 Hysteria2 端口（监听 ::，所有 IP 可用）"
 
-# 生成随机端口
-port_v1=$(shuf -i 20000-40000 -n 1)
-port_v2=$(shuf -i 20000-40000 -n 1)
-while [ $port_v2 -eq $port_v1 ]; do port_v2=$(shuf -i 20000-40000 -n 1); done
-
-port_s1=$(shuf -i 10000-19999 -n 1)
-port_s2=$(shuf -i 10000-19999 -n 1)
-while [ $port_s2 -eq $port_s1 ]; do port_s2=$(shuf -i 10000-19999 -n 1); done
-
-echo "生成的端口："
-echo "  VLESS IP1 ($ip1): $port_v1"
-echo "  VLESS IP2 ($ip2): $port_v2"
-echo "  Socks5 IP1 ($ip1): $port_s1"
-echo "  Socks5 IP2 ($ip2): $port_s2"
-
-# 备份
-cp "$XR_JSON" "$BACKUP_JSON"
-echo "已备份原配置文件到 $BACKUP_JSON"
-
-# 新 inbounds JSON（省略中间长内容，与之前相同）
-new_inbounds=$(cat <<EOF
-[ /* 这里省略了完整的inbounds JSON，与你之前使用的相同 */ ]
-EOF
-)
-
-# 用 jq 更新（如果没 jq 会自动安装）
+# 读取当前 sb.json（用 jq 处理）
 if ! command -v jq >/dev/null; then
     apt update && apt install -y jq
 fi
-jq ".inbounds = $new_inbounds" "$XR_JSON" > "$XR_JSON.tmp" && mv "$XR_JSON.tmp" "$XR_JSON"
 
-# 重启（优先用 systemctl，避免 agsbx 问题）
-systemctl restart xr 2>/dev/null || {
-    pkill -f "xray run" || true
-    nohup /root/agsbx/xray run -c "$XR_JSON" >/dev/null 2>&1 &
+# 备份 sb.json
+backup="$SB_JSON.bak-$(date +%Y%m%d-%H%M%S)"
+cp "$SB_JSON" "$backup"
+echo "备份 sb.json 到 $backup"
+
+# 生成并追加 inbounds
+new_inbounds=()
+
+for ((i=1; i<=num_ports; i++)); do
+    port=$(shuf -i 20000-65535 -n 1)
+    # 避免极端冲突，再随机一次如果必要
+    while grep -q "\"listen_port\": $port" "$SB_JSON"; do
+        port=$(shuf -i 20000-65535 -n 1)
+    done
+
+    tag="hy2-multi-$i"
+
+    inbound=$(cat <<EOF
+{
+  "type": "hysteria2",
+  "tag": "$tag",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
+    {
+      "password": "$uuid"
+    }
+  ],
+  "ignore_client_bandwidth": false,
+  "tls": {
+    "enabled": true,
+    "alpn": ["h3"],
+    "certificate_path": "$CERT_PEM",
+    "key_path": "$KEY_PEM"
+  }
 }
-echo "Xray 服务已重启"
+EOF
+)
 
-# 自动输出完整链接
+    new_inbounds+=("$inbound")
+    echo "生成 Hysteria2 端口 $port (tag: $tag)"
+done
+
+# 用 jq 追加到 inbounds 数组（如果已有 hy2 也会保留）
+current_inbounds=$(jq '.inbounds // []' "$SB_JSON")
+updated_inbounds=$(jq -n --argjson current "$current_inbounds" --argjson new "$(printf '%s\n' "${new_inbounds[@]}" | jq -s '.')" '$current + $new')
+
+jq ".inbounds = $updated_inbounds" "$SB_JSON" > "$SB_JSON.tmp" && mv "$SB_JSON.tmp" "$SB_JSON"
+
+# 重启 Sing-box
+if systemctl is-active sb >/dev/null 2>&1; then
+    systemctl restart sb
+    echo "已重启 Sing-box 服务 (systemctl)"
+else
+    pkill -f "sing-box run" || true
+    nohup sing-box run -c "$SB_JSON" >/dev/null 2>&1 &
+    echo "已通过 nohup 重启 Sing-box"
+fi
+
 echo ""
 echo "======================================"
-echo "          节点链接已生成（直接复制）"
+echo "     Hysteria2 多端口节点链接"
 echo "======================================"
-echo ""
 
-echo "【VLESS - IP1 ($ip1)】"
-vl1="vless://${uuid}@${ip1}:${port_v1}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#VLESS-Reality-${ip1}"
-echo "$vl1"
-echo ""
+# 输出链接（假设服务器有多个 IP，你可以手动替换或用主 IP）
+server_ips=("38.182.100.41" "38.182.100.15")  # ← 这里改成你的实际 IP 列表
 
-echo "【VLESS - IP2 ($ip2)】"
-vl2="vless://${uuid}@${ip2}:${port_v2}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#VLESS-Reality-${ip2}"
-echo "$vl2"
-echo ""
+for ((i=0; i<num_ports; i++)); do
+    # 从 sb.json 提取实际端口（jq 方式）
+    port=$(jq -r ".inbounds[] | select(.tag == \"hy2-multi-$((i+1))\") .listen_port" "$SB_JSON")
 
-echo "【Socks5 - IP1 ($ip1)】"
-echo "地址: ${ip1}"
-echo "端口: ${port_s1}"
-echo "用户名: ${uuid}"
-echo "密码: ${uuid}"
-echo ""
-
-echo "【Socks5 - IP2 ($ip2)】"
-echo "地址: ${ip2}"
-echo "端口: ${port_s2}"
-echo "用户名: ${uuid}"
-echo "密码: ${uuid}"
-echo ""
+    for ip in "${server_ips[@]}"; do
+        link="hysteria2://${uuid}@${ip}:${port}?security=tls&alpn=h3&insecure=1&sni=${sni}#hy2-multi-${ip}-port${port}"
+        echo "【Hysteria2 多端口 $((i+1)) - ${ip}】"
+        echo "$link"
+        echo ""
+    done
+done
 
 echo "======================================"
-echo "防火墙放行命令（必须执行）："
-echo "ufw allow $port_v1/tcp $port_v2/tcp $port_s1/tcp $port_s2/tcp"
-echo "ufw reload"
-echo ""
-echo "节点保存位置：/root/agsbx/multi-nodes-latest.txt （可选cat查看）"
-echo "完成！请在客户端测试连接。"
+echo "防火墙放行示例（所有新端口）："
+echo "ufw allow 20000:65535/udp   # 或针对具体端口"
+echo "完成！请在 Hysteria2 支持的客户端（如 Nekobox、Sing-box、Clash Meta）测试。"
+echo "节点也保存到 $SB_JSON 的 inbounds 中，可随时查看。"
